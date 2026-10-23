@@ -886,6 +886,11 @@ frozen.
   carried no name, so the chip fell back to "account" until the page reloaded. Login and refresh now
   return the display name and avatar as whoami does. The chip's old two-letter initials also broke
   on names starting with an emoji, punctuation or ß; the one-letter avatar replaces them.
+- **Local PDF processing works on macOS.** macOS refuses the address-space limit the PDF worker sets
+  on itself, so every local PDF text extraction, page render and thumbnail there failed. The parent
+  now samples the worker's physical memory footprint every 10 ms and stops it above 384 MiB. This
+  sampled threshold can be exceeded between checks; the worker's CPU, file-size and core-dump limits
+  still apply. Linux keeps its kernel-enforced address-space limit and existing polling behaviour.
 - **Closing a model client mid-stream no longer leaves the stream hanging.** A model-registry reload
   closes each provider's SDK client while a turn may still be streaming. The blocked read was left
   waiting for the server's next byte on Linux and for the full read timeout on macOS, up to ten
