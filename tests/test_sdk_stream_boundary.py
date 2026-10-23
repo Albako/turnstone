@@ -39,7 +39,6 @@ import contextlib
 import copy
 import json
 import socket
-import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -933,42 +932,38 @@ def test_closed_v3_default_client_creation_stays_unarmed(surface: str):
 
 
 def _loopback_lane(lane: str, port: int) -> tuple[Any, Any]:
-    """Real SDK client + provider for one streaming lane on a loopback server.
+    """Turnstone's own SDK client + provider for one streaming lane on a loopback server.
 
-    The Anthropic SDK appends ``/v1/messages`` to ``base_url`` itself; the
-    OpenAI SDK expects the ``/v1`` root.
+    Built through ``create_client`` so the HTTP client is the one production
+    closes during a registry reload. The Anthropic SDK appends ``/v1/messages``
+    to ``base_url`` itself; the OpenAI SDK expects the ``/v1`` root.
     """
-    from turnstone.core.providers import create_provider
+    from turnstone.core.providers import create_client, create_provider
 
+    origin = f"http://127.0.0.1:{port}"
     if lane == "anthropic":
-        client = anthropic.Anthropic(
-            api_key="probe", base_url=f"http://127.0.0.1:{port}", max_retries=0, timeout=5.0
-        )
-        return client, create_provider("anthropic")
-    client = openai.OpenAI(
-        api_key="probe", base_url=f"http://127.0.0.1:{port}/v1", max_retries=0, timeout=5.0
-    )
-    return client, create_provider("openai-compatible", api_surface=lane)
+        client = create_client("anthropic-compatible", base_url=origin, api_key="probe")
+        provider = create_provider("anthropic")
+    else:
+        client = create_client("openai-compatible", base_url=f"{origin}/v1", api_key="probe")
+        provider = create_provider("openai-compatible", api_surface=lane)
+    return client.with_options(max_retries=0, timeout=5.0), provider
 
 
-@pytest.mark.skipif(
-    sys.platform == "darwin",
-    reason="macOS leaves the read blocked after the wire release until the read timeout (#1350)",
-)
 @pytest.mark.parametrize(
     ("lane", "payload"),
     [("chat", CHAT_CHUNK), ("responses", RESPONSES_EVENT), ("anthropic", ANTHROPIC_EVENTS)],
 )
-def test_cross_thread_default_client_close_then_wire_release_is_normalized(lane: str, payload: str):
-    """The ``ModelRegistry.reload()`` shape stays safe at the retry seam.
+def test_cross_thread_client_close_wakes_the_stream_read(lane: str, payload: str):
+    """The ``ModelRegistry.reload()`` shape ends a blocked stream at the retry seam.
 
     Neither OpenAI v3's nor Anthropic v1's synchronous HTTPX2 client promises
-    that cross-thread ``close()`` itself interrupts a blocked body read. Pin
-    the behavior Turnstone needs instead: closing from the admin thread
-    completes safely while a worker is in ``next()``, and the subsequent wire
-    release reaches ``transport_guarded`` as a provider-retryable
-    ``IncompleteStreamError`` for both OpenAI streaming adapters and the
-    Anthropic adapter.
+    that cross-thread ``close()`` interrupts a blocked body read, so Turnstone's
+    clients do it themselves. Closing from the admin thread while a worker is in
+    ``next()`` ends the read while the peer is still connected and silent, and
+    reaches ``transport_guarded`` as a provider-retryable ``IncompleteStreamError``
+    for both OpenAI streaming adapters and the Anthropic adapter. Without the
+    wake the read waits for the peer on Linux and for the read timeout on macOS.
     """
     from turnstone.core.providers import transport_guarded
     from turnstone.core.providers._protocol import IncompleteStreamError
@@ -1050,11 +1045,11 @@ def test_cross_thread_default_client_close_then_wire_release_is_normalized(lane:
         assert reader_blocked.wait(timeout=10.0)
         assert close_done.wait(timeout=10.0)
         assert closer_errors == []
-        # The server has not closed its peer yet, proving close() completed
-        # safely rather than merely returning after an EOF unblocked it.
+        reader_thread.join(timeout=2.0)
+        assert not reader_thread.is_alive(), "close() did not wake the blocked read"
+        # The server has not closed its peer yet, so close() woke the read rather
+        # than an EOF from the peer.
         assert server_errors == []
-        release_peer.set()
-        reader_thread.join(timeout=10.0)
     finally:
         # Unblock and join every thread on every exit path so nothing
         # outlives the test (leaked-thread guard).
